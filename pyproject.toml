@@ -17,6 +17,7 @@ dependencies = [
   "pyarrow>=14.0",
   "lxml>=5.0",
   "requests>=2.31",
+  "wrds>=3.1.6",
 ]
 
 [tool.uv]

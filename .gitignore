@@ -1,0 +1,14 @@
+# Ignore Python bytecode and virtual environment
+__pycache__/
+venv/
+uv.lock
+
+data/
+*.parquet
+*.csv
+
+# Large files & figures
+*.zip
+figures/
+
+

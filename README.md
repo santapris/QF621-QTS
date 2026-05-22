@@ -1,11 +1,16 @@
 Pairs Trading — Quickstart
 
 Setup
-- Python 3.10+
+- Python 3.12+
 - From this folder:
   - Create venv: `python -m venv .venv` and activate it.
   - Install deps with uv (fast): `pip install uv && uv sync`
     or with pip: `python -m pip install -U pip wheel && pip install .`
+
+
+WRDS connection 
+- If want to just connect to `wrds` without loading all the data
+  - run `python -c "import wrds; c=wrds.Connection(); print('connected'); c.close()"` in terminal
 
 Prime data cache
 - `python -c "from spx_data import load_all; load_all(refresh=True)"`
@@ -21,8 +26,7 @@ Backtest (quarterly, Method A, breadth + earlier entry, zero-cost)
 
 Data sources
 - Default: SPX yfinance (prices/volume) cached to parquet (./data/*parquet)
-- Optional: Russell 2000 CSVs (see Modules/Microstructure & QTS/QTS Lectures/Sem1 Data) — not required here
-- Future (WRDS/Bloomberg): historical index membership, CRSP returns, FF factors, FRED rates/credit for richer beta‑space stability
+- Future (WRDS/Bloomberg): historical index membership, CRSP returns, FF factors, FRED rates/credit for richer beta‑space stability (not validated yet)
 
 Notes
 - All scripts assume you run from this folder (local imports).
