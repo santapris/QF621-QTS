@@ -3,9 +3,9 @@ __pycache__/
 venv/
 uv.lock
 
-data/
-*.parquet
-*.csv
+# data/
+# *.parquet
+# *.csv
 
 # Large files & figures
 *.zip
