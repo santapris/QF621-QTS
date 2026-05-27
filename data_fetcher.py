@@ -508,6 +508,7 @@ class DataFetcher:
         tickers: Optional[Iterable[str]] = None,
         start: str = "2014-01-01",
         refresh: bool = False,
+        username: str = "",
     ) -> pd.DataFrame:
         """IBES actual earnings announcement dates per ticker.
 
@@ -517,19 +518,62 @@ class DataFetcher:
         cache = self.data_dir / "ibes_earnings.parquet"
         if cache.exists() and not refresh:
             return pd.read_parquet(cache)
+        
+        username = username or os.environ.get("WRDS_USERNAME", "")
 
-        params: dict = {"anndats_act__gte": start, "fpi": "1"}
-        if tickers:
-            params["ticker__in"] = ",".join(tickers)
+        if username:
+            import wrds as _wrds
+            ticker_clause = ""
+            if tickers:
+                ticker_sql = ", ".join(f"'{t}'" for t in tickers)
+                ticker_clause = f"AND ticker IN ({ticker_sql})"
+            sql = f"""
+                SELECT DISTINCT ticker, anndats_act AS earnings_date
+                FROM ibes.statsum_epsus
+                WHERE anndats_act >= '{start}'
+                    AND fpi = '1'
+                    AND anndats_act IS NOT NULL
+                    {ticker_clause}
+                ORDER BY ticker, anndats_act
+            """
+            db = _wrds.Connection(wrds_username=username) if username else _wrds.Connection()
 
-        df = self._wrds_fetch(
-            "ibes.statsum_epsus",
-            params=params,
-            date_cols=["anndats_act"],
-        )
+            try: 
+                if hasattr(db, "engine") and db.engine is not None:
+                    try:
+                        from sqlalchemy import text as _sql_text
+                    except Exception:
+                        _sql_text = None
+                    with db.engine.connect() as conn:
+                        if _sql_text is not None:
+                            df = pd.read_sql_query(_sql_text(sql), conn, parse_dates=["anndats_act"])
+                        else:
+                            df = db.raw_sql(sql, date_cols=["anndats_act"])
+            except: 
+                if hasattr(db, "engine") and db.engine is not None:
+                    try:
+                        conn = db.engine.raw_connection()
+                        try:
+                            df = pd.read_sql_query(sql, conn, parse_dates=["anndats_act"])
+                        finally:
+                            conn.close()
+                    except Exception:
+                        df = db.raw_sql(sql, date_cols=["anndats_act"])
+            finally:
+                db.close()
+        else: 
+            params: dict = {"anndats_act__gte": start, "fpi": "1"}
+            if tickers:
+                params["ticker__in"] = ",".join(tickers)
 
-        if df.empty:
-            raise RuntimeError("No IBES data returned")
+            df = self._wrds_fetch(
+                "ibes.statsum_epsus",
+                params=params,
+                date_cols=["anndats_act"],
+            )
+
+            if df.empty:
+                raise RuntimeError("No IBES data returned")
 
         df = (
             df[["ticker", "anndats_act"]]
@@ -538,7 +582,8 @@ class DataFetcher:
             .dropna(subset=["earnings_date"])           # NULL anndats_act bypass filter
             .loc[lambda d: d["earnings_date"] >= start] # pre-start rows bypass date filter
             .sort_values(["ticker", "earnings_date"])
-            .reset_index(drop=True)
+            .reset_index(drop
+                         =True)
         )
         df.to_parquet(cache)
         return df
@@ -717,7 +762,8 @@ if __name__ == "__main__":
 
         # 6. IBES earnings
         try:
-            ibes = f.fetch_ibes_earnings_dates(start=args.start, refresh=args.refresh)
+            username = args.username or os.environ.get("WRDS_USERNAME", "")
+            ibes = f.fetch_ibes_earnings_dates(start=args.start, refresh=args.refresh, username=args.username)
             print(f"[ok] ibes_earnings.parquet  {ibes.shape}  ({ibes['ticker'].nunique()} tickers)")
         except Exception as e:
             print(f"[!!] ibes_earnings FAILED: {e}")
