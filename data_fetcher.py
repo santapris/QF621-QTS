@@ -433,14 +433,17 @@ class DataFetcher:
             else:
                 permno_clause = ""
 
-            # Single query: date-bounded JOIN assigns the correct ticker for
-            # each observation period (handles renames/mergers over time).
+            # Pull total return (ret) + volume.
+            # ret is CRSP's dividend-adjusted daily return (decimal).
+            # We build a total-return index (TRI) = (1+ret).cumprod() so that
+            # dividends are properly included in spread construction.
+            # Using prc/cfacpr (split-adjusted price only) causes artificial
+            # spread jumps at every dividend date → false entry signals.
             sql = f"""
                 SELECT
                     d.date,
                     n.ticker,
-                    ABS(d.prc)                            AS prc,
-                    NULLIF(d.cfacpr, 0)                   AS cfacpr,
+                    d.ret,
                     d.vol
                 FROM crsp.dsf AS d
                 INNER JOIN crsp.stocknames AS n
@@ -448,7 +451,6 @@ class DataFetcher:
                     AND d.date  >= n.namedt
                     AND d.date  <= COALESCE(n.nameenddt, CURRENT_DATE)
                 WHERE d.date >= '{start}'
-                  AND d.prc  IS NOT NULL
                   {permno_clause}
             """
             # Prefer SQLAlchemy connection (stable across wrds versions);
@@ -485,16 +487,15 @@ class DataFetcher:
         finally:
             db.close()
 
-        # Use split-adjusted close: raw prc divided by cumulative factor.
-        # ABS(prc) handles CRSP convention of negative prc for bid-quote days.
-        # Adjustment is backward-applied by CRSP but benign for spread/ratio
-        # strategies — the "lookahead" is in levels only, not returns or spread
-        # direction. Without adjustment, stock splits create step jumps that
-        # break ADF cointegration tests and distort hedge ratio estimation.
-        dsf["adj_close"] = dsf["prc"] / dsf["cfacpr"]
-        dsf = dsf.dropna(subset=["adj_close", "ticker"])
+        # Build total-return index (TRI) from ret.
+        # ret=NaN means delisted/no-trade — fill with 0 (price unchanged assumption).
+        # Delisted stocks will have flat TRI after delisting and won't cointegrate
+        # with active stocks, so they're naturally filtered by ADF/HL screens.
+        dsf = dsf.dropna(subset=["ticker"])
+        dsf["ret"] = dsf["ret"].fillna(0.0)
 
-        close_df  = dsf.pivot_table(index="date", columns="ticker", values="adj_close").sort_index()
+        ret_wide  = dsf.pivot_table(index="date", columns="ticker", values="ret").sort_index()
+        close_df  = (1 + ret_wide).cumprod()   # TRI anchored to 1.0 at first date
         volume_df = dsf.pivot_table(index="date", columns="ticker", values="vol").sort_index()
 
         close_df.to_parquet(close_cache)
@@ -508,82 +509,87 @@ class DataFetcher:
         tickers: Optional[Iterable[str]] = None,
         start: str = "2014-01-01",
         refresh: bool = False,
-        username: str = "",
+        wrds_username: str = "",
     ) -> pd.DataFrame:
         """IBES actual earnings announcement dates per ticker.
 
-        REST field: anndats_act (not anndats). Filter: fpi=1 (quarterly actuals).
-        Returns DataFrame [ticker, earnings_date].
+        When wrds_username is provided, uses direct PostgreSQL (pgpass) — one
+        query, much faster than paginated REST for multi-year pulls.
+        Falls back to WRDS REST API when wrds_username is empty.
+
+        Filter: fpi=1 (quarterly actuals). Returns DataFrame [ticker, earnings_date].
         """
         cache = self.data_dir / "ibes_earnings.parquet"
         if cache.exists() and not refresh:
             return pd.read_parquet(cache)
-        
-        username = username or os.environ.get("WRDS_USERNAME", "")
+
+        username = wrds_username or os.environ.get("WRDS_USERNAME", "")
 
         if username:
             import wrds as _wrds
             ticker_clause = ""
             if tickers:
-                ticker_sql = ", ".join(f"'{t}'" for t in tickers)
-                ticker_clause = f"AND ticker IN ({ticker_sql})"
+                t_sql = ", ".join(f"'{t}'" for t in tickers)
+                ticker_clause = f"AND ticker IN ({t_sql})"
             sql = f"""
-                SELECT DISTINCT ticker, anndats_act AS earnings_date
+                SELECT DISTINCT ticker, anndats_act
                 FROM ibes.statsum_epsus
-                WHERE anndats_act >= '{start}'
-                    AND fpi = '1'
-                    AND anndats_act IS NOT NULL
-                    {ticker_clause}
+                WHERE fpi = '1'
+                  AND anndats_act IS NOT NULL
+                  AND anndats_act >= '{start}'
+                  {ticker_clause}
                 ORDER BY ticker, anndats_act
             """
             db = _wrds.Connection(wrds_username=username) if username else _wrds.Connection()
-
-            try: 
-                if hasattr(db, "engine") and db.engine is not None:
-                    try:
-                        from sqlalchemy import text as _sql_text
-                    except Exception:
-                        _sql_text = None
-                    with db.engine.connect() as conn:
-                        if _sql_text is not None:
-                            df = pd.read_sql_query(_sql_text(sql), conn, parse_dates=["anndats_act"])
-                        else:
-                            df = db.raw_sql(sql, date_cols=["anndats_act"])
-            except: 
-                if hasattr(db, "engine") and db.engine is not None:
-                    try:
+            try:
+                try:
+                    if hasattr(db, "engine") and db.engine is not None:
+                        try:
+                            from sqlalchemy import text as _sql_text
+                        except Exception:
+                            _sql_text = None
+                        with db.engine.connect() as conn:
+                            df = pd.read_sql_query(
+                                _sql_text(sql) if _sql_text else sql, conn)
+                    else:
+                        df = db.raw_sql(sql)
+                except Exception:
+                    if hasattr(db, "engine") and db.engine is not None:
                         conn = db.engine.raw_connection()
                         try:
-                            df = pd.read_sql_query(sql, conn, parse_dates=["anndats_act"])
+                            df = pd.read_sql_query(sql, conn)
                         finally:
                             conn.close()
-                    except Exception:
-                        df = db.raw_sql(sql, date_cols=["anndats_act"])
+                    else:
+                        df = db.raw_sql(sql)
             finally:
                 db.close()
-        else: 
+            # normalise column name regardless of case returned by driver
+            date_col = next((c for c in df.columns if c.lower() == "anndats_act"), None)
+            if date_col is None:
+                raise RuntimeError(f"anndats_act not found in IBES result. Columns: {list(df.columns)}")
+            df = df.rename(columns={date_col: "earnings_date"})
+            df["earnings_date"] = pd.to_datetime(df["earnings_date"], errors="coerce")
+        else:
             params: dict = {"anndats_act__gte": start, "fpi": "1"}
             if tickers:
                 params["ticker__in"] = ",".join(tickers)
-
             df = self._wrds_fetch(
                 "ibes.statsum_epsus",
                 params=params,
                 date_cols=["anndats_act"],
             )
-
             if df.empty:
                 raise RuntimeError("No IBES data returned")
+            df = df[["ticker", "anndats_act"]].rename(columns={"anndats_act": "earnings_date"})
 
         df = (
-            df[["ticker", "anndats_act"]]
-            .rename(columns={"anndats_act": "earnings_date"})
+            df
             .drop_duplicates()
-            .dropna(subset=["earnings_date"])           # NULL anndats_act bypass filter
-            .loc[lambda d: d["earnings_date"] >= start] # pre-start rows bypass date filter
+            .dropna(subset=["earnings_date"])
+            .loc[lambda d: d["earnings_date"] >= start]
             .sort_values(["ticker", "earnings_date"])
-            .reset_index(drop
-                         =True)
+            .reset_index(drop=True)
         )
         df.to_parquet(cache)
         return df
@@ -760,10 +766,10 @@ if __name__ == "__main__":
         except Exception as e:
             print(f"[!!] crsp_close/volume FAILED: {e}")
 
-        # 6. IBES earnings
+        # 6. IBES earnings (raw SQL when --username set, REST fallback otherwise)
         try:
-            username = args.username or os.environ.get("WRDS_USERNAME", "")
-            ibes = f.fetch_ibes_earnings_dates(start=args.start, refresh=args.refresh, username=args.username)
+            ibes = f.fetch_ibes_earnings_dates(
+                start=args.start, refresh=args.refresh, wrds_username=args.username)
             print(f"[ok] ibes_earnings.parquet  {ibes.shape}  ({ibes['ticker'].nunique()} tickers)")
         except Exception as e:
             print(f"[!!] ibes_earnings FAILED: {e}")
