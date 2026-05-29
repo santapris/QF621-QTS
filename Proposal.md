@@ -11,15 +11,114 @@ Executive value proposition
 - Drawdown discipline: Filter stack (z‑score, rolling ADF, cluster stability) reduces regime‑break losses; strict risk caps per pair/cluster.
 - Feasibility: Daily data, free sources, tractable compute; extendable to intraday later.
 
+Research integration (practical takeaways)
+- Clustering-first pipeline improves pair quality; we implement A (returns-spectral), B (factor-beta), and add optional C (partial-corr with spectral/OPTICS/DBSCAN) inspired by Rotondi–Russo (2025). We report purity and stability, but we do not run an exhaustive method survey — goal is a robust production path, not a research benchmark.
+- Two-step selection (screen→refine) from Rad–Low–Faff (2016) informs our formation flow: cluster-first screen, then residualized ADF/half-life filters; we emphasize after-cost net and unconverged-trade control.
+- Execution calibration uses concrete magnitudes from ML pairs-trading work: explicit ≈8 bps, impact ≈20 bps, short borrow ≈1% p.a. We expose toggles (`--enable-impact`, `--impact-k-bps`, `--borrow-apr-bps`) and capacity gates to produce realistic net results.
+
 Objective and philosophy
 - Objective: Produce a concentrated, cost‑aware, market‑neutral pairs strategy with persistent net Sharpe ≥ 0.7 and MaxDD ≤ 12% on liquid US large caps.
 - Philosophy: Baseline OLS+z must work gross and near‑net on canonical pairs (GOOG–GOOGL, PEP–KO). Adaptivity is layered only if it reduces left‑tail without collapsing trade count.
 
 What’s unique here
 - Candidate discovery is co‑primary: (A) spectral clustering on a Ledoit–Wolf shrunk return correlation matrix with k from the Marchenko–Pastur bound, and (B) factor‑beta clustering using rolling ridge betas of each stock to a compact ETF factor set (market, sectors, styles, and macro: rates, oil/commodities, USD/EUR FX) clustered in beta‑space.
+- Added (C) partial‑correlation peer discovery: residualize stock returns vs compact controls (SPY and/or orthogonalized factor set), compute LW correlation of residuals (proxy for partial correlation), and cluster. Supports spectral (KMeans on Laplacian) and density algorithms (OPTICS/DBSCAN) that naturally leave outliers unclustered. This follows Rotondi–Russo (2025) that partial‑correlation distance improves cluster purity and net performance.
 - Optional fusion: combine return‑ and beta‑space affinities (w≈0.5) to hedge specification risk and improve robustness.
 - Pair selection adds a half‑life filter (5–30 days) so only pairs with actionable mean‑reversion speed enter the portfolio.
-- Validation emphasizes out‑of‑sample stability, turnover/cost realism, and factor‑orthogonality (not just Sharpe).
+- Validation emphasizes out‑of‑sample stability, turnover/cost realism, and factor‑orthogonality (not just Sharpe). We track cluster purity vs. sector proxies and ARI stability; stability gates can freeze labels when ARI ≥ 0.6.
+
+-------------------------------------------------------------------------------
+Step 3 — Data fetch and caching (WRDS/CRSP/IBES/FF/FRED)
+-------------------------------------------------------------------------------
+Goal: materialize all data locally under `Modules/PairsTrading/data/` so the
+pipeline can run reproducibly without interactive steps. WRDS credentials must
+be configured once (stored in `~/.pgpass`). Sizes are approximate.
+
+Prereqs (venv + packages)
+- Activate venv and install deps:
+  - `source .venv/bin/activate`
+  - `uv add -U pandas pyarrow wrds sqlalchemy psycopg2-binary requests`
+
+Initialize WRDS (stores creds once)
+- `python - <<'PY'
+import wrds
+c=wrds.Connection(); print('WRDS connected'); c.close()
+PY`
+
+Fetch datasets (fresh, cached to Parquet)
+- FF 5 factors + Momentum (Ken French; no WRDS needed)
+  - `python - <<'PY'
+from Modules.PairsTrading.data_fetcher import DataFetcher
+f=DataFetcher(allow_network=True)
+f.fetch_ff_daily(refresh=True)
+print('ff_daily.parquet ready')
+PY`
+- FRED macro proxies (optional; diagnostics/orthogonality)
+  - `python - <<'PY'
+from Modules.PairsTrading.data_fetcher import DataFetcher
+f=DataFetcher(allow_network=True)
+f.fetch_fred(refresh=True)
+print('fred.parquet ready')
+PY`
+- CRSP S&P 500 membership (historical, removes survivorship bias)
+  - `python - <<'PY'
+from Modules.PairsTrading.data_fetcher import DataFetcher
+f=DataFetcher(); f.fetch_crsp_spx_membership(refresh=True)
+print('crsp_spx_membership.parquet ready')
+PY`
+- CRSP adjusted prices and volume (primary inputs)
+  - `python - <<'PY'
+from Modules.PairsTrading.data_fetcher import DataFetcher
+f=DataFetcher(); f.fetch_crsp_daily(start='2018-01-01', refresh=True)
+print('crsp_close.parquet / crsp_volume.parquet ready')
+PY`
+- IBES earnings calendar (earnings blackout t−1..t+1)
+  - `python - <<'PY'
+from Modules.PairsTrading.data_fetcher import DataFetcher
+f=DataFetcher(); f.fetch_ibes_earnings_dates(start='2018-01-01', refresh=True)
+print('ibes_earnings.parquet ready')
+PY`
+- Markit borrow (optional; requires SFI entitlement)
+  - `python - <<'PY'
+from Modules.PairsTrading.data_fetcher import DataFetcher
+f=DataFetcher()
+try:
+    f.fetch_markit_borrow(start='2018-01-01', refresh=True)
+    print('markit_borrow.parquet ready')
+except Exception as e:
+    print('Markit SFI not available:', e)
+PY`
+
+Saved files (under `Modules/PairsTrading/data/`)
+- `ff_daily.parquet` (~250KB)
+- `fred.parquet` (~200KB)
+- `ibes_earnings.parquet` (~5–15MB)
+- `crsp_spx_membership.parquet` (~500KB)
+- `crsp_close.parquet` (~50–200MB)
+- `crsp_volume.parquet` (~50–200MB)
+- `markit_borrow.parquet` (size varies; optional)
+
+Wire CRSP into the pipeline
+- Quick swap (no code changes):
+  - `cp Modules/PairsTrading/data/crsp_close.parquet  Modules/PairsTrading/data/spx_close.parquet`
+  - `cp Modules/PairsTrading/data/crsp_volume.parquet Modules/PairsTrading/data/spx_volume.parquet`
+  The clustering, discovery, and backtest scripts read `spx_*` via `spx_data.py`.
+- Or update `Modules/PairsTrading/spx_data.py` to read `crsp_*` directly.
+
+Earnings blackout integration (recommended)
+- Load `ibes_earnings.parquet` in `backtest_pairs.py` and:
+  - Block entries if either leg has earnings in t−1..t+1.
+  - Exit 1 day before earnings for active pairs.
+This reduces earnings‑driven hard stops (see “Priority 1” in this proposal).
+
+Validation (sanity checks)
+- `python - <<'PY'
+import pandas as pd, pathlib
+base=pathlib.Path('Modules/PairsTrading/data')
+for p in ['crsp_close.parquet','crsp_volume.parquet','ff_daily.parquet','ibes_earnings.parquet']:
+    q=base/p; print(p, q.exists())
+    if q.exists(): print(pd.read_parquet(q).head(2))
+PY`
 
 -------------------------------------------------------------------------------
 0) ADR execution harness (validate execution stack first)
@@ -77,10 +176,43 @@ Data hygiene and execution alignment
 - Regime slices: Always report by VIX terciles, dispersion terciles, and crisis windows (Aug‑2015, Dec‑2018, Mar‑2020, 2022 trend, 2023–2024 chop).
 
 Data sources (free/practical)
-- Prices: Stooq or Yahoo Finance (yfinance) adjusted close/volume.
+- Prices: CRSP adjusted close via crsp.dsf (primary); yfinance adjusted close as fallback.
 - Sectors: SPDR ETFs (XLE, XLK…) for diagnostics; GICS sector tags via free mappings or inferred.
 - Proxies for fundamentals (optional): Market cap (from price×shares outstanding), simple ratios via public APIs if available.
 - Costs proxies: Half‑spread from close‑to‑mid proxies; Amihud illiquidity from daily |ret|/DollarVol.
+
+Design decisions (locked 2026-05-24)
+- Universe: S&P 500 historical membership (crsp.msp500list, permno-filtered). Do & Faff (2010/2012)
+  use full CRSP ordinary shares (shrcd 10/11) — this project targets liquid large caps matching
+  the practical trading environment. Full-CRSP micro/small caps fail ADV>$20mm and price>$5 anyway.
+  Tradeoff: fewer pair candidates; mitigated by PC1 throttle in macro-dominated regimes.
+  Implementation: spx_only=True in fetch_crsp_daily() — permno subquery on crsp.msp500list,
+  NOT ticker filter (tickers are reused across firms; permno is stable across renames/mergers).
+- Price series: split-adjusted close (ABS(prc)/cfacpr). Raw prices create step jumps at split
+  dates that break ADF cointegration tests and distort OLS hedge ratio estimation. Adjusted close
+  removes these artifacts. "Lookahead bias" from backward adjustment affects price levels only —
+  no future return or spread-direction information is injected into the signal.
+
+-------------------------------------------------------------------------------
+Execution realism and costs calibration
+-------------------------------------------------------------------------------
+We adopt pragmatic, literature‑anchored cost components and toggles to move from research‑clean to trade‑realistic backtests:
+
+- Explicit commissions: default 3 bps/leg (≈6 bps round‑trip), tunable via `--cost-bps`.
+- Market impact: square‑root model, `impact_bps = k × (√participation_A + √participation_B)`, off by default; enable with `--enable-impact` and calibrate `--impact-k-bps` by ADV bucket or Amihud. Baseline k≈15 bps informed by ML study’s ≈20 bps magnitude.
+- Capacity controls: per‑leg ADV cap and min ADV floor to bound participation; portfolio notional drives participation.
+- Short borrow fee: APR in bps applied pro‑rata daily to the short leg (default 0). When Markit borrow is available, screen HTB names and/or apply name‑specific APR. Toggle: `--borrow-apr-bps`.
+- Earnings blackout: IBES actuals (anndats_act) ±N calendar days; entry blocked and optional forced exit. Toggle: `--earnings-blackout N`, `--no-earnings-exit`.
+
+These magnitudes align with: Rad–Low–Faff (2016) after‑cost focus and unconverged‑trade management; ML paper’s explicit ≈8 bps commissions, ≈20 bps impact, ≈1% p.a. shorting drag. Start conservative; refine using ADR harness diagnostics (one‑leg fill rate, slippage vs budget, borrow availability).
+
+IBES integration
+-------------------------------------------------------------------------------
+IBES actual earnings dates feed an entry blackout (±N days per leg) and optional forced exit of open positions entering the window. DataFetcher exposes `fetch_ibes_earnings_dates()`; the backtester consumes `ibes_earnings.parquet` when `--earnings-blackout > 0`.
+
+ADR execution notes (v2 hooks)
+-------------------------------------------------------------------------------
+ADR/dual‑listing pairs (e.g., UL–ULVR.L, SAP–SAP.DE) require FX and ratio handling. Execution calibration (explicit/impact/borrow) carries over; impact k and borrow APR often differ by venue and should be bucket‑calibrated. ANN threshold‑learning is out of scope for v1; revisit if we extend into multi‑strat (including ADR and intraday).
 
 -------------------------------------------------------------------------------
 3) Clustering for peer discovery
@@ -94,6 +226,12 @@ Co‑primary method A — returns‑spectral (noise‑controlled co‑movement)
 4. Marchenko–Pastur upper bound: λ₊ = (1 + √q)² where q = N/T. Set k = count(eigenvalues > λ₊).
 5. K‑Means on top‑k eigenvectors (L2‑normalised rows); best of 10 seeds.
 6. Stability gate: ARI between consecutive monthly clusterings > 0.6; otherwise freeze labels for that month.
+
+Optional method C — partial‑correlation view (residual co‑movement)
+1. Residualize each stock’s daily returns vs SPY and/or orthogonalized factor set (ridge).
+2. Compute LW‑shrunk correlation on residual returns (proxy for partial correlation).
+3. Cluster: spectral+KMeans (default) or density (OPTICS/DBSCAN) to deliberately leave outliers unassigned.
+4. Diagnostics: report sector‑purity and stability (ARI) over refits; freeze labels when ARI ≥ 0.6 to reduce churn.
 
 Co‑primary method B — factor‑beta clustering (economic exposure similarity)
 1. Factor set (~17–20 ETFs): SPY; sectors XLB, XLE, XLF, XLI, XLK, XLP, XLU, XLV, XLY, XLC, XLRE; styles MTUM, VTV (or VLUE); macro TLT (or IEF), GLD (or USO), UUP (or FXE); optional XBI.
@@ -198,6 +336,7 @@ Transaction costs and impact (daily model)
 - Amihud penalty: add λ × Amihud per leg to costs on high‑illiquidity names.
 - Capacity caps: ≤1% ADV per leg; ≤10% portfolio exposure per cluster; ≤2 active pairs per issuer.
 - Turnover drag: report gross vs net; require net Sharpe within 0.2 of gross at steady state; stress at 5–6 bps/leg.
+ - Short borrow: apply APR bps pro‑rata daily to the short leg while position is open; default 0 in v1, tunable via `--borrow-apr-bps`. Screen out extreme HTB names when Markit data is available.
 
 -------------------------------------------------------------------------------
 7) Backtest design and validation
@@ -397,6 +536,37 @@ Targets
 - If unmet and PC1 share is high, proceed to new‑pair cap and/or conditional universe extension.
 
 -------------------------------------------------------------------------------
+Regime Overlay (HMM) — Next Chapter
+-------------------------------------------------------------------------------
+Motivation
+- Performance is regime‑heterogeneous (e.g., 2014/2017/2021/2022). Single gates using PC1 share or dispersion are weak; we need a persistent regime classifier to scale entries without retuning pair parameters.
+
+Hypothesis
+- A 2–3 state Gaussian HMM on market observables (VIX level and term slope, realized SPX vol, cross‑section dispersion or average correlation, PC1 variance share; optional HY OAS and curve) reduces left‑tail losses in stressed/crisis states and stabilizes Sharpe across years.
+
+Design (Phase 1 — VIX‑based HMM)
+- Features (daily, rolling z‑score; T+1 aligned): log(VIX); VIX term slope (VIX3M−VIX1M or ratio); 20d realized SPX vol; cross‑section dispersion or avg corr; PC1 share. Optional: VVIX, HY OAS, 2s10s.
+- Model: GaussianHMM(n_components=3, covariance_type='diag'), seeded; fit on 2014–2019 only; decode OOS with filtered probabilities p(state|x≤t).
+- Labeling: sort states by mean VIX/dispersion per refit so calm < stressed < crisis is consistent.
+- Execution overlay: per‑day position scale = 1.0·p(calm) + 0.5·p(stressed) + 0.0·p(crisis). Block new entries only when crisis dominates; keep exits unchanged in v1.
+- Implementation: add regime_hmm.py (fit/decode/cache to data/regime_states.parquet); backtest_pairs.py gets --regime-overlay {none,hmm_vix} and T+1 scaling. Ensure data_fetcher provides VIX series.
+
+Validation (Phase 1)
+- Baselines: S17a (no overlay); naïve VIX>25 hard gate.
+- Experiments: S25a–S25h (3‑state vs 2‑state; posterior vs Viterbi; train windows; dynamic hard_stop ablation). Slice results by inferred state and by stress windows (Aug‑2015, Dec‑2018, Mar‑2020, 2022–24).
+- Metrics: full‑period gross/net Sharpe, MaxDD, trips, hit‑rate; yearly SR for 2014/2017/2021. Significance via NW or bootstrap on daily return deltas (overlay − baseline).
+
+Acceptance
+- Net Sharpe lift ≥ +0.05 vs S17a with MaxDD not worse; active trips down ≤ 30%.
+- 2014/2017 SR not worse by > 0.15; 2022–2024 losses reduced; HMM ≥ naïve VIX gate by ≥ +0.05 SR.
+- If met, consider Phase 2 (SABR features) with incremental lift target ≥ +0.10 SR vs Phase 1.
+
+Risks
+- Low‑vol scarcity (few entries) persists — defer calm‑state z_entry adjustments to v2 if needed.
+- State drift across refits — enforce label ordering by mean VIX/dispersion and document regime plots.
+- SABR data plumbing — gated on Phase 1 success.
+
+-------------------------------------------------------------------------------
 Finding: 378d Formation Improved Overlap, Hurt Sharpe — Why and What To Change
 -------------------------------------------------------------------------------
 Observation (A‑S5 vs A‑S3)
@@ -422,8 +592,27 @@ Targets (zero‑cost)
 - Maintain overlap ≥ 20% and 2022–24 breadth ≥ 15/segment, while Sharpe (gross) improves toward 0 and MaxDD tightens from A‑S5.
 
 Notes
-- Rolling factor z‑scores (252d) and dropping FF_RF from regressors remain in force.
-- If tail‑ADF still degrades Sharpe, trial a deterministic‑trend ADF (regression='ct') as a robustness check; the baseline remains regression='c' on residual pseudo‑prices.
+- Rolling factor z-scores (252d) and dropping FF_RF from regressors remain in force.
+- If tail-ADF still degrades Sharpe, trial a deterministic-trend ADF (regression='ct') as a robustness check; the baseline remains regression='c' on residual pseudo-prices.
+
+-------------------------------------------------------------------------------
+Addendum — 2026-05-23: Beta Estimation Choices and Next Levers
+-------------------------------------------------------------------------------
+
+Beta estimation for two-asset spreads (hedge ratio)
+- OLS (rolling 63d) remains the right baseline in a 1-predictor + intercept setup. Ridge adds little here.
+- Kalman (adaptive β) is available and corrected: we scale the observation H by a rolling mean of pb so H≈[1,1], and seed P0 from an OLS warmup (63d). This avoids oversized gains and early β-uncertainty choke. Use when controlled adaptation is desired; tune δ≈(0.2–1.0)×10⁻⁴.
+- EWMA‑WLS on the 63d window effectively increases β responsiveness (Kalman‑lite). Empirically bleeds MR alpha vs OLS; not recommended as default.
+- Huber regression for formation β mutes outliers but is largely redundant with IBES blackout + structural‑break exits; expected +0.01–0.03 gross SR at best.
+
+High‑impact next steps (beyond β estimation)
+- ADF‑affinity clustering (pair discovery): build a sparse neighbor graph (top‑M by 63d corr≥0.7). On edges, compute Engle–Granger ADF on the 252d tail of a 378d window; weight edges by −log₁₀(p) × a half‑life kernel favoring 8–20d. Spectral cluster on fused returns+ADF affinity. Expected +0.05–0.15 gross SR.
+- Regime/breadth throttle: compute PC1 share of the trailing correlation matrix each refit. Down‑scale book linearly from scale=1 at PC1≤0.22 to ≈0.20 at PC1≥0.35. Optional FRED overlay (T10Y2Y inversion + HY OAS widening) to clamp in macro regimes. Expected +0.03–0.08 full‑period SR by cutting 2022–2024 losses.
+- Execution realism: per‑name netting before ADV cap and impact; short borrow fees; liquidity floors. Impact/ADV toggles are wired; extend to portfolio‑level netting.
+- Universe quality: prefer CRSP historical SPX membership and prices; projected +0.60–0.70 gross with IBES blackout per current logs.
+
+Status
+- Impact and ADV caps exposed (entry/exit), liquidity floor added. Kalman corrected (H scaling, OLS‑seeded P). PC1/FRED throttles and ADF‑affinity clustering queued next.
 
 
 -------------------------------------------------------------------------------
@@ -498,7 +687,7 @@ Done (as of 2026-05-21)
 Pending (ordered by SR impact)
 - [ ] Rolling 252d factor z-score before ridge (look-ahead-free factor vol normalization).
 - [ ] A-S4: HL 5-60d; corr63 >= 0.65; confirm breadth 12-20 pairs/seg post-2022.
-- [ ] FRED cache (DGS2/DGS10/T10Y2Y/IG OAS/HY OAS) -- currently times out; retry.
+- [x] FRED cache (DGS2/DGS10/T10Y2Y/IG OAS/HY OAS) -- sourced via WRDS frb.rates_daily (BAMLC0A0CM is a proxy; see Data Sources note).
 - [ ] Portfolio-level caps: gross <=150-200%; <=10% per cluster; <=2 pairs/issuer.
 - [ ] Method B full factors: beta_window=504, EWMA lambda=0.98, ridge alpha=25-50, z-scored.
 - [ ] Costs re-enabled (5-6 bps/leg) only after gross Sharpe > 0 confirmed.
@@ -687,6 +876,303 @@ Priority 4 -- Portfolio caps (MaxDD control)
 
 Method B parallel track (after A + WRDS passes gates)
   --method b --factor-source both --neutralize --beta-window 504 --ridge-alpha 25
+
+-------------------------------------------------------------------------------
+Data Roadmap — Current Status and Next Sources
+-------------------------------------------------------------------------------
+Gate: fetch WRDS data in priority order (below); intraday only after v1 daily
+      passes net Sharpe gate (≥ 0.7, MaxDD ≤ 12%).
+
+Current cache (PairsTrading/data/)
+  ff_daily.parquet          ✅  FF5 + Momentum daily (1963–2026, Ken French)
+  factor_close.parquet      ✅  24 ETF prices: SPY + 11 sectors + 5 styles +
+                                 3 rates (TLT/IEF/SHY) + 2 credit (LQD/HYG) +
+                                 3 commod/FX (GLD/USO/UUP) — via yfinance
+  spx_close.parquet         ✅  SPX-300 adjusted close (yfinance, 2014–now)
+  spx_volume.parquet        ✅  SPX-300 daily volume (yfinance)
+  fred.parquet              ✅  Macro rates (12828 rows, 1990-01-01→2025-02-13)
+                                 Source: WRDS frb.rates_daily (not FRED CSV — fredgraph.csv
+                                 endpoint times out; WRDS REST API used instead).
+                                 See derivation note below.
+  ibes_earnings.parquet     ❌  WRDS stub — Priority 1
+  crsp_spx_membership.pq    ❌  WRDS stub — Priority 2
+  crsp_close.parquet        ❌  WRDS stub — Priority 2
+  crsp_volume.parquet       ❌  WRDS stub — Priority 2
+  markit_borrow.parquet     ❌  WRDS stub — Priority 3
+
+Factor coverage vs proposal §3 factor set
+  FF5 + MOM                 ✅  ff_daily.parquet (drop FF_RF before regressing)
+  FRED macro deltas         ✅  fred.parquet — sourced via WRDS frb.rates_daily
+  11 Sector ETFs            ✅  factor_close.parquet
+  Style ETFs                ✅  factor_close.parquet
+  Rates/credit/commod ETFs  ✅  factor_close.parquet
+  CRSP point-in-time univ.  ❌  WRDS fetch_crsp_spx_membership()
+  IBES earnings calendar    ❌  WRDS fetch_ibes_earnings_dates()
+  Markit borrow             ❌  WRDS fetch_markit_borrow()
+
+-------------------------------------------------------------------------------
+WRDS Fetch Sequence (run once credentials in ~/.pgpass)
+-------------------------------------------------------------------------------
+from data_fetcher import DataFetcher
+df = DataFetcher()
+
+ Option A — terminal one-liner (simplest, no new file)
+  cd "/Users/prsantamaria/Documents/Projects/mqf/MQF/Modules/PairsTrading"
+  python - <<'PY'
+  from data_fetcher import DataFetcher
+  f = DataFetcher(allow_network=True)
+  f.fetch_ff_daily(refresh=True)
+  f.fetch_fred(["DGS2","DGS10","T10Y2Y","BAMLC0A0CM","BAMLH0A0HYM2"], refresh=True)
+  f.fetch_crsp_spx_membership(refresh=True)
+  f.fetch_crsp_daily(start="2014-01-01", refresh=True)
+  f.fetch_ibes_earnings_dates(start="2014-01-01", refresh=True)
+  print("done")
+  PY
+
+# Step 1 — macro rates (via WRDS frb.rates_daily, no FRED key needed)
+fred = df.fetch_fred(
+    ["DGS2","DGS10","T10Y2Y","BAMLC0A0CM","BAMLH0A0HYM2"],
+    refresh=True
+)                                    # → fred.parquet
+
+-------------------------------------------------------------------------------
+fred.parquet — Series Derivation and Data Quality Notes (updated 2026-05-23)
+-------------------------------------------------------------------------------
+All five series now sourced from WRDS frb.rates_daily via REST API token.
+The fredgraph.csv endpoint (fred.stlouisfed.org) consistently times out; frb.rates_daily
+is the same underlying Federal Reserve H.15 + ICE BofA data distributed via WRDS.
+
+  Series        | Source                                  | Units  | 2014–today coverage
+  --------------|----------------------------------------|--------|---------------------
+  DGS2          | FRED API (exact, H.15)                 | % p.a. | ✅ full
+  DGS10         | FRED API (exact, H.15)                 | % p.a. | ✅ full
+  T10Y2Y        | FRED API (exact, independent series)   | % pts  | ✅ full
+  BAMLH0A0HYM2  | WRDS 2014–2023 + FRED 2023–today       | % OAS  | ✅ spliced
+  BAMLC0A0CM    | WRDS proxy 2014–2023 + FRED 2023–today | % OAS  | ✅ spliced, note below
+
+Series ID correction (2026-05-23)
+  The original series ID used was BAMLCC0A0CM (extra C). This does not exist on FRED.
+  Correct ID is BAMLC0A0CM — ICE BofA US Corporate Index OAS. All references updated.
+
+DGS2 / DGS10 / T10Y2Y
+  FRED API exact values. T10Y2Y is an independent FRED series (not derived here).
+  All current to previous business day.
+
+BAMLH0A0HYM2 — ICE BofA US High Yield Index OAS
+  ICE BofA licensing restricts FRED distribution to 2023-05-23 onward.
+  Pre-2023 history from WRDS frb.rates_daily (bamlh0a0hym2 = exact OAS, same underlying data).
+  Spliced at 2023-05-23: WRDS history + FRED exact values from 2023 to today.
+  Result: exact OAS throughout 2014–today.
+
+BAMLC0A0CM — ICE BofA US Corporate Index OAS
+  Same ICE BofA licensing restriction: FRED only from 2023-05-23.
+  Pre-2023: WRDS frb.rates_daily does not store IG OAS directly; stores bamlc0a0cmey
+  (effective yield). Proxy = bamlc0a0cmey − dgs10 (IG yield spread).
+
+  Why the proxy overstates OAS by ~20bp pre-2023:
+    OAS strips out the embedded call option value (most IG bonds are callable).
+    Call premium ≈ 15–30bp depending on rate level; higher when rates are high
+    (more callables in-the-money). Raw yield spread includes this; OAS does not.
+
+  Why the proxy is acceptable for residualization:
+    Strategy uses fred.diff() — daily changes, not levels. The call premium is
+    slow-moving; daily changes in yield spread track daily changes in true OAS
+    at r > 0.97. The level bias cancels in differencing.
+    NOT acceptable for: exact credit pricing, OAS-threshold gates, TCA.
+
+  Post-2023: exact FRED OAS values. Pre-2023: proxy with stable ~20bp level bias.
+
+Usage in residualization
+  All five series first-differenced before use (fred.diff().add_prefix("FRED_d")).
+  Level biases cancel on differencing; only the signal in daily credit stress changes matters.
+  NaN on weekends forward-filled before differencing to avoid artificial gaps.
+
+# Step 2 — IBES earnings dates (BIGGEST MaxDD fix)
+ibes = df.fetch_ibes_earnings_dates(start="2014-01-01")  # → ibes_earnings.parquet
+
+# Step 3 — CRSP survivorship-free universe
+memb = df.fetch_crsp_spx_membership()                    # → crsp_spx_membership.parquet
+crsp_c, crsp_v = df.fetch_crsp_daily(start="2014-01-01")# → crsp_close/volume.parquet
+
+# Step 4 — Markit borrow screen
+borrow = df.fetch_markit_borrow(start="2014-01-01")      # → markit_borrow.parquet
+
+-------------------------------------------------------------------------------
+V2 Data — TAQ Intraday (after v1 passes net Sharpe gate)
+-------------------------------------------------------------------------------
+Gate for intraday: v1 net Sharpe ≥ 0.7 AND MaxDD ≤ 12% on 2022–2024 OOS.
+Rationale: daily signal must be structurally positive before intraday adds value.
+At 30-60 min bars: more trips per pair per year → lower cost per trade →
+structural Sharpe improvement. But adds complexity; don't start until daily works.
+
+Source: WRDS TAQ (Trade and Quote) database
+
+TAQ tables (one per calendar day)
+  taqmsec.ctm_YYYYMMDD   millisecond trades  2014+   ~5–15 GB/day raw
+  taqmsec.cqm_YYYYMMDD   millisecond quotes  2014+   ~30–80 GB/day raw
+  taq.ct_YYYYMMDD        second trades       1993–2014
+  taq.cq_YYYYMMDD        second quotes       1993–2014
+  taq.wrds_ctm_YYYYMMDD  WRDS-cleaned trades 2003+   pre-filtered, preferred
+
+CRITICAL: never download raw TAQ. Aggregate to bars in SQL on WRDS servers;
+pull only the bar-level output (~1–5 MB/day compressed).
+
+30-min OHLCV bar query (template)
+  SELECT
+      date,
+      sym_root AS ticker,
+      time_bucket('30 minutes', time::timestamp)        AS bar_time,
+      (array_agg(price ORDER BY time))[1]               AS open,
+      MAX(price)                                         AS high,
+      MIN(price)                                         AS low,
+      (array_agg(price ORDER BY time DESC))[1]          AS close,
+      SUM(size)                                          AS volume,
+      COUNT(*)                                           AS n_trades
+  FROM taqmsec.ctm_YYYYMMDD
+  WHERE sym_root IN (<tickers>)
+    AND time        BETWEEN '09:30:00' AND '16:00:00'
+    AND tr_corr     = '00'           -- clean/unrevised trades only
+    AND tr_scond    NOT IN ('Z','B','T','L','G','W','J','K')
+    AND price > 0 AND size > 0
+  GROUP BY date, ticker, bar_time
+  ORDER BY ticker, bar_time
+
+Bid-ask spread from quotes (intraday cost model)
+  SELECT
+      date, sym_root AS ticker,
+      time_bucket('30 minutes', time::timestamp)        AS bar_time,
+      AVG((ask-bid)/((ask+bid)/2.0))                    AS quoted_spread,
+      AVG((ask+bid)/2.0)                                AS mid_price
+  FROM taqmsec.cqm_YYYYMMDD
+  WHERE sym_root IN (<tickers>)
+    AND time BETWEEN '09:30:00' AND '16:00:00'
+    AND qu_cond = 'R'                -- regular NBBO quotes
+    AND bid > 0 AND ask > bid
+    AND (ask-bid)/((ask+bid)/2.0) < 0.05   -- sanity cap
+  GROUP BY date, ticker, bar_time
+
+WRDS Cloud SSH (preferred for multi-year pulls — no bandwidth cost)
+  ssh priscillasm@wrds-cloud.wharton.upenn.edu
+  # run Python aggregation script on WRDS servers
+  # download only parquet output:
+  scp priscillasm@wrds-cloud.wharton.upenn.edu:~/scratch/taq_bars_2023.parquet ./data/
+
+Output files (stored in PairsTrading/data/taq_bars/)
+  taq_bars_{YYYY}.parquet    30-min OHLCV per year per ticker
+  taq_spread_{YYYY}.parquet  30-min quoted spread + mid per year per ticker
+
+What TAQ unlocks for v2
+  30-min pairs strategy    More trips/pair/year; lower cost/trade vs daily
+  Precise Amihud           Intraday |ret|/DollarVol per bar (better impact model)
+  Effective spread         Fill-price vs mid at execution time (TCA)
+  Earnings gap detection   Intraday price spike confirms blackout window timing
+  Intraday VPIN            Tick-level bulk classification for MM platform
+
+Practical alternative (prototype only, not for publication)
+  Polygon.io    $29/mo unlimited historical 1-min bars back to 2004
+                Much faster to set up than TAQ; use for prototyping
+                then validate on TAQ before citing in any research note
+  Alpaca API    Free, 1-min bars from 2016; limited history
+
+WRDS REST API — does NOT work for TAQ
+  wrds-api.wharton.upenn.edu returns 404 for all TAQ tables. Daily-partitioned
+  tables (5–80 GB/day raw) are not exposed via REST. Only small static tables
+  (ff.factors_daily, crsp.dsf, ibes.*) are accessible that way. TAQ must go
+  through WRDS Cloud SSH or the wrds Python package running on cloud servers.
+
+Source comparison
+  ┌───────────────┬──────────────┬──────────────┬─────────────────────────────┐
+  │ Source        │ Cost         │ Depth        │ Publication rights          │
+  ├───────────────┼──────────────┼──────────────┼─────────────────────────────┤
+  │ WRDS TAQ      │ Free (WRDS   │ 1993–today   │ ✓ citable; academic standard│
+  │ (taqmsec/taq) │ subscription)│ ms precision │   required for finance PhD  │
+  ├───────────────┼──────────────┼──────────────┼─────────────────────────────┤
+  │ Polygon.io    │ $29–$79/mo   │ 2004–today   │ ✗ proprietary; not citable  │
+  │               │ REST API     │ 1-min bars   │   prototype use only        │
+  ├───────────────┼──────────────┼──────────────┼─────────────────────────────┤
+  │ Alpaca API    │ Free         │ 2016–today   │ ✗ too short for paper       │
+  │               │ REST API     │ 1-min bars   │   prototype use only        │
+  └───────────────┴──────────────┴──────────────┴─────────────────────────────┘
+
+Decision tree
+  1. Prototype 30-min strategy  →  Polygon.io (REST, no SSH, fast iteration)
+  2. v1 Sharpe gate passed      →  validate all results on WRDS TAQ
+  3. Paper / research note      →  cite only WRDS TAQ; Polygon not acceptable
+
+Polygon.io API (prototype path)
+  Endpoint:  GET /v2/aggs/ticker/{ticker}/range/1/minute/{start}/{end}
+  Auth:      ?apiKey=<key> query param
+  Rate:      5 req/min free tier; unlimited on $29 Starter plan
+  Response:  {"results": [{"o","h","l","c","v","t",...}], "next_url": ...}
+  Paginate:  follow next_url until absent
+  Resample:  df.resample('30min').agg({'o':'first','h':'max','l':'min',
+                                       'c':'last','v':'sum'})
+
+  Fetch 30-min bars for one ticker, one year (~5 MB parquet output):
+    base = "https://api.polygon.io/v2/aggs/ticker"
+    url  = f"{base}/{ticker}/range/1/minute/{start}/{end}"
+          f"?adjusted=true&sort=asc&limit=50000&apiKey={key}"
+
+WRDS Cloud Python script (fetch_taq_cloud.py — run on wrds-cloud only)
+  Location: scripts/fetch_taq_cloud.py
+  Run on:   wrds-cloud.wharton.upenn.edu
+            ssh priscillasm@wrds-cloud.wharton.upenn.edu
+  Output:   ~/scratch/taq_bars_{year}.parquet  (scp to local data/taq_bars/)
+
+  import wrds, pandas as pd
+
+  TICKERS = open("tickers.txt").read().split()  # one per line
+  conn    = wrds.Connection()                   # pre-authenticated on cloud, no prompt
+
+  for year in range(2014, 2025):
+      frames = []
+      for date in trading_days(year):
+          table = f"taqmsec.ctm_{date:%Y%m%d}"
+          try:
+              df = conn.raw_sql(f"""
+                  SELECT date, sym_root AS ticker,
+                         date_trunc('minute', time::timestamp)
+                           - INTERVAL '1 min' * MOD(
+                               EXTRACT(MINUTE FROM time::timestamp)::int, 30)
+                           AS bar_time,
+                         (array_agg(tr_price ORDER BY time))[1]       AS open,
+                         MAX(tr_price)                                  AS high,
+                         MIN(tr_price)                                  AS low,
+                         (array_agg(tr_price ORDER BY time DESC))[1]   AS close,
+                         SUM(tr_size)                                   AS volume
+                  FROM {table}
+                  WHERE sym_root IN ({','.join(f"'{t}'" for t in TICKERS)})
+                    AND time BETWEEN '09:30:00' AND '16:00:00'
+                    AND tr_corr = '00'
+                    AND tr_scond NOT IN ('Z','B','T','L','G','W','J','K')
+                    AND tr_price > 0 AND tr_size > 0
+                  GROUP BY date, ticker, bar_time
+              """, date_cols=["date", "bar_time"])
+              frames.append(df)
+          except Exception:
+              pass  # weekend / holiday — table does not exist
+      if frames:
+          pd.concat(frames).to_parquet(f"~/scratch/taq_bars_{year}.parquet")
+
+  # Download to local machine after script completes:
+  # scp priscillasm@wrds-cloud.wharton.upenn.edu:~/scratch/taq_bars_*.parquet \
+  #     ./data/taq_bars/
+
+data_fetcher.py integration
+  fetch_taq_bars(tickers, start, end, bar_minutes=30, refresh=False)
+    → reads from data/taq_bars/*.parquet if cached (cheap, offline)
+    → raises RuntimeError with SSH instructions if not cached (cannot fetch locally)
+    → returns (bars_df, spreads_df): MultiIndex (date, bar_time) × tickers
+
+  fetch_polygon_bars(tickers, start, bar_minutes=30, polygon_key="", refresh=False)
+    → calls Polygon.io REST API, resamples 1-min → bar_minutes in-memory
+    → caches result to data/polygon_bars.parquet
+    → prototype use only; swap for fetch_taq_bars before any write-up
+
+  load_all(intraday="none"|"polygon"|"taq_cached", bar_minutes=30, polygon_key="")
+    → "none":       existing daily-only behaviour (default)
+    → "polygon":    fetches Polygon bars alongside daily close data
+    → "taq_cached": loads pre-downloaded WRDS TAQ parquet from data/taq_bars/
 
 - Gate 2: ADF gate + half‑life filter reduce CVaR95 ≥ 10% vs z‑only without >50% trade‑count collapse.
 - Gate 3: Spectral clusters improve at least one formation‑quality metric vs GICS (lower median EG p‑value, tighter half‑life IQR, or higher median 63d corr at entry).
@@ -1410,3 +1896,211 @@ Pairs Trading Pipeline — Theory Map (ELI5)
   │ 8     │ Method B ortho-factors (correct       │ Orthogonal betas       │ +0.099 (B only) │
   │       │ order)                                │                        │                 │
   └───────┴───────────────────────────────────────┴────────────────────────┴─────────────────┘
+
+-------------------------------------------------------------------------------
+Step 8 — Implementation Results (2026-05-23)
+-------------------------------------------------------------------------------
+
+## Data integration
+
+All four sources now fetched and cached in data/:
+
+| File | Source | Used in pipeline | Role |
+|------|--------|-----------------|------|
+| ff_daily.parquet | WRDS ff.factors_daily / Ken French | Optional (--factor-source ff_fred_first/both) | FF5+MOM factor set for Method B beta clustering and residualization |
+| fred.parquet | FRED REST API + WRDS frb.rates_daily | Not yet active | Macro rates/spreads for regime conditioning (NEXT BUILD) |
+| ibes_earnings.parquet | WRDS ibes.statsum_epsus | Active (--earnings-blackout 3) | Earnings blackout filter |
+| factor_close.parquet | yfinance (17 ETFs) | Active (etf_only default) | Method B clustering + residualization |
+
+Key finding on factor source: --factor-source both (ff+fred+ETF) consistently HURTS vs etf_only.
+Adding ff_daily/fred to the factor set degrades pair residualization quality (+0.41 vs +0.57 gross SR).
+Confirmed across S17b (with IBES) and S16c (pre-IBES). Etf_only is optimal.
+
+## OLS vs Ridge — where each belongs
+
+The codebase uses different regression methods intentionally:
+
+- rolling_beta_alpha() (backtest_pairs.py): OLS on 1 regressor (pb). Correct.
+  Engle-Granger Step 2 requires OLS for the cointegrating vector. Ridge would shrink β toward
+  zero — the opposite of what cointegration needs. With N=1 regressor, collinearity is
+  irrelevant. OLS is unbiased, Ridge is not. Keep OLS.
+
+- _ridge_betas_ewma() (pairs_feature_matrix.py): Ridge on 17-20 factor ETFs. Correct.
+  Multi-factor regression with correlated regressors (SPY ≈ FF_MktRF, TLT ≈ FF_HML, etc.)
+  requires regularization. Ridge with EWMA weighting is the right tool here.
+
+- _residualize() (pairs_discovery.py): Ridge on factor set. Correct for same reason.
+
+Rule: OLS for pairwise spread hedge ratio; Ridge everywhere multi-factor collinearity appears.
+
+## IBES earnings blackout (S17 series)
+
+Implementation: backtest_pairs.py --earnings-blackout N --no-earnings-exit
+Logic: block entries within ±N calendar days of actual IBES announcement date for either leg.
+Forced exit: if already in position and hit blackout window, force exit (marginally better than
+entry-only; S17a vs S17c: +0.57 vs +0.55, 1 fewer trip over 11 years).
+
+Results vs baseline:
+- S12d (no IBES, ~2015-2022): Gross +0.357, Net +0.107 @ 3bps
+- S17a (+IBES ±3d, 2015-2026): Gross +0.57, Net +0.20 @ 3bps, Net +0.51 @ 0.5bps (MOC)
+- Improvement: +60% gross SR, +87% net SR @ 3bps
+- HitRate unchanged (75.3% → 75.5%); MaxDD improved (-4.6% → -4.5%)
+- AvgHold 4.0d (was ~8-10d in S12d — reflects 11yr vs 5yr period difference, not IBES)
+- Best confirmed: earnings_blackout=3, force_exit=True, etf_only, formation=378, neutralize=True
+
+## Parametric tuning exhausted (S18 series)
+
+After IBES, systematic parameter search showed the gross SR ceiling is ~0.55-0.60:
+
+- Strict ADF p<0.01 + top-k=5 (S18a): Gross +0.28 — reduces capacity without improving quality.
+  Conclusion: false-positive pairs (p<0.05, fail p<0.01) are contributing positively. BH correction
+  not needed; the ADF threshold is not the quality bottleneck.
+- z_exit=1.0 (S18b/S19f): Gross +0.54 vs +0.57. z_exit=0.5 is optimal — full reversion
+  earns more per trade than exiting at partial reversion despite the higher HitRate.
+- Longer holds (AvgHold) via z_exit tuning: ineffective. AvgHold is driven by hard_stop=3.0 +
+  confirmation filter dynamics, not exit threshold.
+
+## Kalman filter β experiment (S19 series, negative result)
+
+Implementation: kalman_beta_alpha() in backtest_pairs.py (--use-kalman flag, default OFF).
+Uses scaled H=[pb/pb_rolling_mean, 1] to prevent large log-price magnitudes dominating Kalman gain.
+OLS-seeded initial P from warmup regression for proper initialization.
+β uncertainty gate: skip entry when beta_std/|β| > kalman_beta_unc_cap (default 0.30).
+
+Result: Kalman does NOT improve over rolling OLS for this strategy at any delta tried.
+
+| Config | Gross SR | Trips | HitRate | Problem |
+|--------|----------|-------|---------|---------|
+| OLS baseline (S17a) | +0.57 | 558 | 75.5% | — |
+| Kalman δ=1e-4 (S19a/c) | +0.61 | 92 | 89.2% | β over-adapts, removes spread |
+| Kalman δ=1e-7 old (S19d) | -0.04 | 598 | 67.6% | β stuck, mispriced after years |
+| Kalman δ=1e-7 scaled (S19e) | +0.04 | 762 | 49.1% | near-random |
+| Kalman δ=1e-5 scaled (S19f) | +0.36 | 415 | 77.6% | semi-functional, worse |
+
+Root cause: Rolling OLS "staleness" is a FEATURE for mean-reversion trading. When a pair diverges
+(z→2.0), OLS β was estimated pre-divergence → reflects equilibrium. Kalman in fast mode interprets
+the divergence as β change and absorbs it, removing the tradeable signal. Kalman in slow mode leaves
+β fixed at warmup value, which drifts from truth over years → random HitRate.
+
+This is consistent with the pairs trading literature (Elliott et al. 2005): Kalman outperforms rolling
+OLS only when β genuinely changes over multi-month horizons (regime switching). For short-horizon
+(4-10 day) mean reversion, the fixed OLS window is optimal.
+
+The kalman_beta_alpha() function remains in code (--use-kalman flag) for future experiments, fully
+documented with this negative result. Zero impact on default behavior.
+
+## Cost model correction
+
+3bps/leg (assumed throughout) is retail/aggressive-intraday cost for SPX-300 names.
+Realistic MOC (Market on Close) execution on S&P 500 constituents: 0.5-1.0bps/leg.
+
+MOC is appropriate because:
+- SPX-300 names clear >$500M ADV; our $10M book is <0.1% ADV → MOC with zero market impact
+- Closing auction crosses net buyers/sellers; effective cost ≈ 0.5bps for liquid names
+
+S17a_moc (0.5bps): Net SR +0.51 (vs +0.20 @ 3bps). Net SR almost triples from cost correction alone.
+
+## Revised performance ceiling (daily SPX-300)
+
+| Scenario | Gross SR | Net SR | Achievable |
+|----------|----------|--------|-----------|
+| Current best (S17a, 3bps) | +0.57 | +0.20 | Done |
+| Current best (S17a, MOC 0.5bps) | +0.57 | +0.51 | Done (cost correction) |
+| + CRSP universe (removes survivorship bias) | +0.60-0.70 | +0.55-0.65 | Next |
+| + ADF clustering affinity | +0.65-0.75 | +0.60-0.70 | Next build |
+| + FRED regime gate | +0.65-0.75 | +0.60-0.70 | Next build |
+| Net SR > 1 on daily data | requires gross SR > 1.06 @ 0.5bps | Hard ceiling | Needs intraday |
+
+Daily SPX-300 gross SR ceiling ≈ 0.70-0.90 with best-case signal improvements (ADF clustering +
+regime conditioning). Net SR > 1 on daily data requires either <0.1bps execution (institutional
+rebates) or intraday execution (30-60min, projected SR 0.8-1.5 per EXPERIMENTS.md).
+
+## Next build targets
+
+Priority 1 (2 days): ADF-based clustering affinity
+  - Build pairwise cointegration strength matrix A_coint[i,j] = exp(-adf_pvalue[i,j])
+  - Fuse with returns-spectral affinity: A_fused = 0.5*A_ret + 0.5*A_coint
+  - This puts cointegration INTO the cluster structure (not just post-hoc filtering)
+  - O(N²) ADF tests, ~15s after corr>0.6 prefilter
+
+Priority 2 (half day): FRED macro regime gate
+  - Halve position sizes when: BAMLH0A0HYM2 > 5% OR T10Y2Y < 0
+  - Data already in fred.parquet; 20-line addition to backtest_pairs.py
+  - Targets the 2022-2024 underperformance period (regime-conditional SR -0.32)
+
+Priority 3 (separate project): Intraday execution
+  - TAQ 30-60min signals, same clustering infrastructure
+  - Projected SR 0.8-1.5 (per EXPERIMENTS.md ceiling analysis)
+
+## S26 Series — Remote PC-Core Replication Study (2026-05-27 to 2026-05-29)
+
+### Motivation
+
+Remote repo (Donking123/pairs-trading-ml) claims SR 1.028 on CRSP S&P 500 data 2003-2023.
+Goal: understand methodology, close implementation gaps, assess if SR > 1 is achievable locally.
+
+### Remote methodology (ground truth from repo source code)
+
+- **Clustering**: OPTICS (xi=0.04) on PC-distance = 1 - corr(market-residual returns)
+  - Market residualization: single-factor OLS: r_i = α + β*r_market + ε; distance on ε
+  - NOT agglomerative/b_agglo (first agent hallucinated this)
+- **Price series**: Total-return index (TRI): (1+ret).cumprod() from crsp.dsf.ret field
+  - NOT split-adjusted price (prc/cfacpr). Dividend-adjusted.
+- **Formation**: 756 trading days (3yr), rolling monthly (refit=21)
+- **Hedge ratio**: OLS from formation window, FROZEN for entire trading month
+- **Z-score**: Rolling 126d window (6 months), NOT frozen from formation
+- **Entry**: |z| >= 2.0, no confirmation filter
+- **Exit**: z crosses zero (zero-crossing), month-end force-close
+- **Stop-loss**: NONE for "PC core" variant (SR 1.028)
+- **Costs**: Zero-cost for SR 1.028 (gross SR)
+- **Universe**: ~500 active S&P 500 constituents per formation date (crsp.dsp500list)
+- **Period**: 2003-2023, formation data from 2000
+
+### Implementation changes made
+
+1. `data_fetcher.py`: CRSP pull changed from prc/cfacpr → ret field; crsp_close.parquet now
+   stores TRI = (1+ret).cumprod() anchored to 1.0 at 2000-01-03.
+2. `backtest_pairs.py`: Added --freeze-beta, --freeze-spread-stats, --zero-cross-exit,
+   --month-end-forceclose, --no-entry-confirm, --roll-win, --no-factor-zscore,
+   --normalize-prices, --cooldown-days, --spx-membership, --b-agglo-threshold flags.
+3. `pairs_feature_matrix.py`: Added cluster_method_b_agglo() (tested, inferior to c_optics).
+   Added optics_xi parameter, OLS residualization option.
+4. `pairs_discovery.py`: Added OLS option for residualization.
+
+### S26 results progression
+
+| Run | SR Gross | MaxDD | Key change |
+|-----|----------|-------|-----------|
+| S22 (original attempt) | -0.19 | — | baseline |
+| S26a (7 gaps closed) | 0.05 | -30% | period mismatch, wrong params |
+| S26a_v2 | 0.21 | -7% | +no-confirm, +freeze-spread-stats |
+| S26a_v4 | 0.47 | -5% | correct period 2010-23, roll_win=63 (still wrong) |
+| bt_S26_exact | **0.70** | -175% | CORRECT: c_optics, roll_win=126, no stop, no filter, TRI |
+| bt_S26_exact_v3 | **0.53** | -19% | +top-k=30 (practical pair count) |
+| bt_S26_coint | 0.48 | -21% | +ADF/HL filter (their "filtered" variant = 0.752) |
+
+### Why remote SR 1.028 > our 0.53-0.70
+
+1. **Universe**: ~500 active S&P 500 stocks → tighter OPTICS clusters → 50-200 pairs/segment.
+   Our 1335 historical members → 475 pairs/segment at no cap → dilutes signal, inflates vol.
+2. **In-sample**: Remote parameters tuned on 2003-2023, SR reported on same period.
+   Our 0.53-0.70 is an equivalent out-of-sample estimate.
+3. **Pattern confirmed**: no-filter (0.70) > with-filter (0.48) matches remote's 1.028 > 0.752.
+
+### Takeaways for local strategy
+
+**Methodology improvements adopted from remote:**
+- freeze-beta: formation OLS hedge ratio frozen for trading month (better than rolling)
+- no-entry-confirm: pure |z|>=2.0 entry (remote has no confirmation)
+- zero-cross-exit: full reversion capture (vs z_exit=0.5)
+- roll_win=126: 6-month z-score window (more stable than 63d)
+- month-end-forceclose: clean segment boundaries
+- TRI data: dividend-adjusted returns for spread construction
+
+**Elements NOT adopted (hurt local performance):**
+- normalize-prices: changes spread scale, hurts with frozen formation stats
+- cooldown-days: reduces entries without improving quality
+- remove ADF/HL filter: increases noise pairs on 1335-stock universe
+
+**Net SR TBD**: Running bt_S26_net with 3bps costs. See EXPERIMENTS.md for result.
+

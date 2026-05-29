@@ -59,25 +59,24 @@ def _residualize(
     ret_series: pd.Series,
     factor_rets: pd.DataFrame,
     ridge_alpha: float = 10.0,
+    use_ols: bool = False,
 ) -> pd.Series:
-    """Remove common factor exposure via ridge regression; return idiosyncratic residuals.
+    """Remove common factor exposure; return idiosyncratic residuals.
 
-    WHY: Raw log-price spread = idiosyncratic + common factor component.
-    ADF on raw spread detects factor cointegration (spurious) as well as true
-    idiosyncratic mean-reversion. Factor drift → ADF passes/fails inconsistently.
-    Residualizing first removes the common component so ADF tests only the
-    idiosyncratic relationship — more stable quarter-to-quarter.
-
-    Ref: Avellaneda & Lee (2010) §3 — statistical arbitrage using PCA/factor residuals.
+    use_ols=True: plain OLS via lstsq (remote PC-core approach).
+    use_ols=False: Ridge(alpha) for regularized stability (default).
     """
-    from sklearn.linear_model import Ridge
-
     aligned = factor_rets.reindex(ret_series.index).fillna(0.0)
-    X = aligned.values
+    X = np.c_[np.ones(len(aligned)), aligned.values]
     y = ret_series.fillna(0.0).values
-    ridge = Ridge(alpha=ridge_alpha, fit_intercept=True)
-    ridge.fit(X, y)
-    residuals = y - ridge.predict(X)
+    if use_ols:
+        coef = np.linalg.lstsq(X, y, rcond=None)[0]
+        residuals = y - X @ coef
+    else:
+        from sklearn.linear_model import Ridge
+        ridge = Ridge(alpha=ridge_alpha, fit_intercept=True)
+        ridge.fit(X[:, 1:], y)
+        residuals = y - ridge.predict(X[:, 1:])
     return pd.Series(residuals, index=ret_series.index)
 
 
@@ -143,6 +142,7 @@ class Filters:
     # ── Avellaneda-Lee residual spread mode ──────────────────────────────
     neutralize_factors: bool = False
     neutralize_ridge_alpha: float = 10.0
+    neutralize_use_ols: bool = False  # OLS instead of Ridge for residualization
 
 
 def discover_pairs(
@@ -191,7 +191,7 @@ def discover_pairs(
             resid: dict[str, pd.Series] = {}
             for nm in names:
                 r = sub_rets[nm].fillna(0.0)
-                resid[nm] = _residualize(r, fret_window, filt.neutralize_ridge_alpha)
+                resid[nm] = _residualize(r, fret_window, filt.neutralize_ridge_alpha, use_ols=filt.neutralize_use_ols)
             resid_df = pd.DataFrame(resid)
             # Cumulative residual returns → acts as "residual price" for spread
             cumresid_df = resid_df.cumsum()
@@ -270,7 +270,12 @@ def discover_pairs(
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--source", choices=["russell", "spx"], default="russell")
-    ap.add_argument("--method", choices=["a", "b", "fused"], default="a")
+    ap.add_argument(
+        "--method",
+        choices=["a", "b", "fused", "a_coint", "c", "c_optics", "c_dbscan"],
+        default="a",
+        help="Clustering method: A (returns), B (beta), fused, A+cointegration, or C=partial-corr variants",
+    )
     ap.add_argument("--n-clusters", type=int, default=10, help="Only for russell corr/beta KMeans path")
     ap.add_argument("--corr-window", type=int, default=126)
     ap.add_argument("--pca", type=int, default=20)
@@ -304,15 +309,30 @@ def main():
             raise RuntimeError("SPX path unavailable (spx_data/pairs_feature_matrix not importable)")
         close_df, volume_df, ret_df, fclose, frets = spx_load_all(refresh=False)
         end_date = ret_df.index[-1]
-        if args.method == "a":
-            labs, k = spx_cluster_a(ret_df, end_date=end_date, window=args.corr_window)
-        elif args.method == "b":
-            labs_a, k = spx_cluster_a(ret_df, end_date=end_date, window=args.corr_window)
-            labs = spx_cluster_b(ret_df, frets, end_date=end_date, k=k)
+        if args.method in {"a", "b", "fused", "a_coint"}:
+            if args.method == "a":
+                labs, k = spx_cluster_a(ret_df, end_date=end_date, window=args.corr_window)
+            elif args.method == "b":
+                labs_a, k = spx_cluster_a(ret_df, end_date=end_date, window=args.corr_window)
+                labs = spx_cluster_b(ret_df, frets, end_date=end_date, k=k)
+            elif args.method == "fused":
+                labs, k = spx_cluster_fused(
+                    ret_df, frets, end_date=end_date,
+                    corr_window=args.corr_window, beta_window=max(args.beta_window, args.corr_window), w_ret=0.5,
+                )
+            else:  # a_coint
+                from pairs_feature_matrix import cluster_a_coint
+                labs, k = cluster_a_coint(
+                    ret_df, close_df, end_date=end_date,
+                    corr_window=args.corr_window, coint_window=args.formation,
+                    w_coint=0.5, min_corr_prefilter=0.70,
+                )
         else:
-            labs, k = spx_cluster_fused(
-                ret_df, frets, end_date=end_date,
-                corr_window=args.corr_window, beta_window=max(args.beta_window, args.corr_window), w_ret=0.5,
+            # Method C family: partial-correlation with spectral/OPTICS/DBSCAN
+            from pairs_feature_matrix import cluster_method_c_partialcorr
+            algo = {"c": "spectral", "c_optics": "optics", "c_dbscan": "dbscan"}[args.method]
+            labs, k = cluster_method_c_partialcorr(
+                ret_df, frets, end_date=end_date, window=args.corr_window, algo=algo
             )
 
     filt = Filters(min_corr63=args.min_corr, min_hl=args.min_hl, max_hl=args.max_hl, adf_alpha=args.adf_alpha)

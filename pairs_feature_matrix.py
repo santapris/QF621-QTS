@@ -46,11 +46,12 @@ from typing import Optional, Tuple
 
 import numpy as np
 import pandas as pd
-from sklearn.cluster import KMeans
+from sklearn.cluster import KMeans, AgglomerativeClustering
 from sklearn.covariance import LedoitWolf
-from sklearn.linear_model import Ridge
+from sklearn.cluster import OPTICS, DBSCAN
+from sklearn.linear_model import Ridge, RidgeCV
 from sklearn.metrics import adjusted_rand_score
-from sklearn.preprocessing import normalize
+from sklearn.preprocessing import normalize, StandardScaler
 
 
 # ── Constants ──────────────────────────────────────────────────────────
@@ -95,6 +96,13 @@ def _lw_correlation(R: np.ndarray) -> np.ndarray:
     C = cov / np.outer(std, std)
     np.fill_diagonal(C, 1.0)
     return C
+
+
+def _corr_to_distance(C: np.ndarray) -> np.ndarray:
+    """Map correlation to distance in [0,2]: D = 1 - C (diag=0)."""
+    D = 1.0 - C
+    np.fill_diagonal(D, 0.0)
+    return D
 
 
 def _kmeans_best(X: np.ndarray, k: int, seeds: int = KMEANS_SEEDS) -> np.ndarray:
@@ -335,6 +343,118 @@ def _spectral_on_affinity(A: np.ndarray, k: int) -> np.ndarray:
     return _kmeans_best(V, k)
 
 
+# ── Method C: Partial-correlation + density clustering (optional) ──────
+
+def _residualize_vs_controls(
+    stock_rets: pd.DataFrame,
+    control_rets: pd.DataFrame,
+    ridge_alpha: float = RIDGE_ALPHA,
+    use_ols: bool = False,
+) -> pd.DataFrame:
+    """Regress each stock's returns on controls; return residual returns.
+
+    use_ols=True: plain OLS via lstsq (remote PC-core approach).
+    use_ols=False: Ridge(alpha) for regularized stability (default).
+    """
+    ctrl = control_rets.reindex(stock_rets.index).dropna(how="all", axis=1).fillna(0.0)
+    if ctrl.empty:
+        return stock_rets.fillna(0.0)
+    X = np.c_[np.ones(len(ctrl)), ctrl.values]
+    out = {}
+    for tkr in stock_rets.columns:
+        y = stock_rets[tkr].fillna(0.0).values
+        try:
+            if use_ols:
+                coef = np.linalg.lstsq(X, y, rcond=None)[0]
+                out[tkr] = y - X @ coef
+            else:
+                model = Ridge(alpha=ridge_alpha, fit_intercept=True)
+                model.fit(X[:, 1:], y)
+                out[tkr] = y - model.predict(X[:, 1:])
+        except Exception:
+            out[tkr] = y * 0.0
+    return pd.DataFrame(out, index=stock_rets.index)
+
+
+def cluster_method_c_partialcorr(
+    stock_rets: pd.DataFrame,
+    control_rets: pd.DataFrame,
+    end_date: Optional[pd.Timestamp] = None,
+    window: int = CORR_WINDOW,
+    algo: str = "spectral",
+    k_override: Optional[int] = None,
+    optics_min_samples: int = 2,
+    optics_xi: float = 0.05,
+    dbscan_eps: float = 0.5,
+    dbscan_min_samples: int = 2,
+    use_ols: bool = False,
+):
+    """Cluster on residual-return correlations (partial corr proxy).
+
+    algo:
+      - 'spectral': spectral + KMeans(k) on LW corr of residuals (default)
+      - 'optics'  : OPTICS(metric='precomputed') on distance D=1-C (outliers=-1)
+      - 'dbscan'  : DBSCAN(metric='precomputed') on D (outliers=-1)
+
+    Returns (labels: pd.Series, k: int). For optics/dbscan, k counts non-outlier clusters.
+    """
+    w = _slice_window(stock_rets, end_date, window)
+    tickers = w.columns.tolist()
+    res = _residualize_vs_controls(w, control_rets, use_ols=use_ols)
+    C = _lw_correlation(res.values)
+    if algo == "spectral":
+        T, N = res.shape
+        k = k_override if k_override is not None else select_k_mp(C, T)
+        V = _spectral_embedding(C, k)
+        labels = _kmeans_best(V, k)
+        return pd.Series(labels, index=tickers, name="cluster_c"), k
+    # Density-based with precomputed distance
+    D = _corr_to_distance(C)
+    if algo == "optics":
+        optics = OPTICS(metric="precomputed", min_samples=optics_min_samples, xi=optics_xi)
+        optics.fit(D)
+        labels = optics.labels_.astype(int)
+        k = int(len(set(labels)) - (1 if -1 in labels else 0))
+        return pd.Series(labels, index=tickers, name="cluster_c_optics"), max(k, 0)
+    if algo == "dbscan":
+        db = DBSCAN(metric="precomputed", eps=dbscan_eps, min_samples=dbscan_min_samples)
+        db.fit(D)
+        labels = db.labels_.astype(int)
+        k = int(len(set(labels)) - (1 if -1 in labels else 0))
+        return pd.Series(labels, index=tickers, name="cluster_c_dbscan"), max(k, 0)
+    # Fallback
+    T, N = res.shape
+    k = k_override if k_override is not None else select_k_mp(C, T)
+    V = _spectral_embedding(C, k)
+    labels = _kmeans_best(V, k)
+    return pd.Series(labels, index=tickers, name="cluster_c"), k
+
+
+# ── Diagnostics: purity vs sector proxy (optional helper) ──────────────
+
+def purity_index(labels: pd.Series, sector_map: dict[str, str]) -> float:
+    """Compute cluster purity relative to sector_map {ticker: sector}.
+
+    Returns [0,1]; NaN if insufficient mapping. Non-invasive utility.
+    """
+    lbl = labels.dropna()
+    if lbl.empty:
+        return float("nan")
+    buckets: dict[int, list[str]] = {}
+    for t, c in lbl.items():
+        s = sector_map.get(t)
+        if s is not None:
+            buckets.setdefault(int(c), []).append(s)
+    N = sum(len(v) for v in buckets.values())
+    if N == 0:
+        return float("nan")
+    top = 0
+    for v in buckets.values():
+        vc = pd.Series(v).value_counts()
+        top += int(vc.iloc[0]) if not vc.empty else 0
+    return float(top / N)
+
+
 def cluster_method_b(
     stock_rets: pd.DataFrame,
     factor_rets: pd.DataFrame,
@@ -390,6 +510,63 @@ def cluster_method_b(
     return pd.Series(labels, index=beta_scaled.index, name="cluster_b")
 
 
+def cluster_method_b_agglo(
+    stock_rets: pd.DataFrame,
+    factor_rets: pd.DataFrame,
+    end_date: Optional[pd.Timestamp] = None,
+    window: int = BETA_WINDOW,
+    ridge_alphas: tuple = (0.01, 0.1, 1.0, 10.0, 100.0),
+    distance_threshold: float = 0.4,
+) -> tuple:
+    """Remote PC-core clustering: RidgeCV betas → correlation distance → agglomerative.
+
+    Exact replication of Rotondi & Russo (2025) 03_clustering.py:
+      1. StandardScaler on factor returns
+      2. RidgeCV (cross-validated alpha) per stock, unscale betas back
+      3. Pairwise distance = 1 - corr(beta_i, beta_j)
+      4. AgglomerativeClustering(linkage='average', distance_threshold=0.4)
+
+    Returns (labels: pd.Series, k: int).
+    """
+    sw = _slice_window(stock_rets, end_date, window)
+    fw = factor_rets.reindex(sw.index).fillna(0.0).dropna(axis=1, how="all")
+    if fw.empty or sw.empty:
+        return pd.Series(dtype=int), 0
+
+    scaler = StandardScaler()
+    X_sc = scaler.fit_transform(fw.values)
+    ridge = RidgeCV(alphas=list(ridge_alphas), fit_intercept=True)
+
+    betas: dict = {}
+    for tkr in sw.columns:
+        y = sw[tkr].fillna(0.0).values
+        try:
+            ridge.fit(X_sc, y)
+            betas[tkr] = ridge.coef_ / scaler.scale_
+        except Exception:
+            betas[tkr] = np.zeros(fw.shape[1])
+
+    beta_df = pd.DataFrame(betas, index=fw.columns).T  # (stocks × factors)
+    B = beta_df.fillna(0.0).values
+
+    if B.shape[0] < 3:
+        return pd.Series(dtype=int), 0
+
+    corr = np.corrcoef(B)
+    D = np.clip(1.0 - corr, 0.0, 2.0)
+    np.fill_diagonal(D, 0.0)
+
+    model = AgglomerativeClustering(
+        n_clusters=None,
+        metric="precomputed",
+        linkage="average",
+        distance_threshold=distance_threshold,
+    )
+    labels = model.fit_predict(D)
+    k = len(set(labels))
+    return pd.Series(labels, index=beta_df.index, name="cluster_b_agglo"), k
+
+
 # ── Fusion ─────────────────────────────────────────────────────────────
 
 def cluster_fused(
@@ -443,6 +620,209 @@ def cluster_fused(
     labels = _spectral_on_affinity(A_fused, k_b)
 
     return pd.Series(labels, index=common_tickers, name="cluster_fused"), k_b
+
+
+# ── Cointegration affinity (A_coint) ──────────────────────────────────
+
+def build_coint_affinity(
+    close_df: pd.DataFrame,
+    end_date: Optional[pd.Timestamp] = None,
+    corr_window: int = CORR_WINDOW,
+    coint_window: int = 252,
+    min_corr_prefilter: float = 0.70,
+    adf_maxlag: int = 1,
+) -> Tuple[np.ndarray, list]:
+    """Build pairwise cointegration affinity matrix for spectral clustering.
+
+    WHY THIS EXISTS:
+    Method A clusters on returns correlation — finds stocks that co-move, but
+    cointegration (stationarity of the spread) is tested post-hoc in discovery
+    via a hard ADF p-value threshold. Consequence: cluster structure is blind to
+    cointegration quality. ~22 false-positive pairs per cluster expected at p<0.05
+    (C(30,2)=435 pairs × 0.05 = 21.8).
+
+    A_coint bakes cointegration strength DIRECTLY into the cluster structure so
+    pairs within the same cluster have ex-ante higher cointegration probability.
+    Discovery still filters with ADF — this just ensures the upstream cluster
+    structure supplies it with better raw material.
+
+    Algorithm:
+    1. Compute LW correlation on log-returns → prefilter to corr ≥ min_corr_prefilter.
+       (Reduces 44,850 pairs for N=300 to ~2,000-4,000 — makes runtime tractable.)
+    2. For each prefiltered pair (i,j): OLS beta → spread → ADF p-value (fixed maxlag=1
+       for speed; autolag is ~5× slower and overkill for pairs pre-screened by HL<30d).
+    3. A_coint[i,j] = exp(-3 * p_value): soft affinity in (0,1].
+       Mapping: p=0 → 1.0 (perfect), p=0.05 → 0.86, p=0.10 → 0.74, p=1.0 → 0.05.
+       Unprefiltered pairs (corr too low to bother): A_coint[i,j] = 0.0.
+
+    Runtime: ~2,500 pairs × 0.5ms (maxlag=1, 252-obs) ≈ 1.3s per refit.
+    Over 46 refits (11-year backtest): ~60s overhead. Full run ~2 min vs ~50s for Method A.
+
+    Args:
+        close_df:            (dates × tickers) adjusted close prices
+        end_date:            formation end date; defaults to last available
+        corr_window:         trailing days for LW correlation prefilter (126d default)
+        coint_window:        trailing days used for ADF spread construction (252d default)
+        min_corr_prefilter:  LW corr threshold below which ADF is skipped (0.70 default)
+        adf_maxlag:          fixed lag for adfuller; 1 is fast and sufficient for HL<30d
+
+    Returns:
+        A_coint: (N × N) float64 affinity matrix
+        tickers: list of N tickers corresponding to matrix rows/columns
+    """
+    from statsmodels.tsa.stattools import adfuller
+
+    logp = np.log(close_df.replace(0, np.nan))
+
+    # ── Slice windows ──────────────────────────────────────────────────────
+    # corr_window: for the LW correlation prefilter (shorter, faster, more current)
+    # coint_window: for the OLS spread + ADF (longer → more ADF power)
+    w_corr = _slice_window(close_df.pct_change(), end_date, corr_window)
+    tickers = w_corr.columns.tolist()
+    N = len(tickers)
+
+    if N < 2:
+        return np.ones((N, N)), tickers
+
+    w_logp = _slice_window(logp, end_date, coint_window)
+    # Restrict to tickers present in both windows
+    tickers = [t for t in tickers if t in w_logp.columns]
+    N = len(tickers)
+    if N < 2:
+        return np.ones((N, N)), tickers
+
+    w_corr = w_corr[tickers]
+    w_logp = w_logp[tickers]
+
+    # ── LW correlation for prefilter ───────────────────────────────────────
+    R = w_corr.fillna(0.0).values
+    C = _lw_correlation(R)   # (N × N) symmetric, diagonal = 1
+
+    # ── Build A_coint ──────────────────────────────────────────────────────
+    A = np.zeros((N, N), dtype=np.float64)
+    np.fill_diagonal(A, 1.0)
+
+    logp_vals = w_logp.ffill().bfill().values  # (T × N)
+    T = logp_vals.shape[0]
+    ones_col = np.ones(T)
+
+    for i in range(N):
+        for j in range(i + 1, N):
+            if C[i, j] < min_corr_prefilter:
+                continue  # leave A[i,j]=0.0
+
+            pi = logp_vals[:, i]
+            pj = logp_vals[:, j]
+
+            # Mask out NaN rows
+            mask = np.isfinite(pi) & np.isfinite(pj)
+            if mask.sum() < 30:
+                continue
+
+            pi_m, pj_m = pi[mask], pj[mask]
+
+            # OLS: pi = beta * pj + alpha + spread
+            X = np.c_[pj_m, ones_col[: mask.sum()]]
+            coef = np.linalg.lstsq(X, pi_m, rcond=None)[0]
+            beta, alpha = float(coef[0]), float(coef[1])
+            if not np.isfinite(beta) or abs(beta) < 0.05 or abs(beta) > 20.0:
+                continue
+
+            spread = pi_m - (beta * pj_m + alpha)
+            if spread.std() < 1e-8:
+                continue
+
+            try:
+                pval = float(adfuller(spread, maxlag=adf_maxlag, regression="c")[1])
+            except Exception:
+                continue
+
+            if not np.isfinite(pval):
+                continue
+
+            aff = float(np.exp(-3.0 * pval))  # p=0→1.0, p=0.05→0.86, p=1.0→0.05
+            A[i, j] = A[j, i] = aff
+
+    return A, tickers
+
+
+def cluster_a_coint(
+    stock_rets: pd.DataFrame,
+    close_df: pd.DataFrame,
+    end_date: Optional[pd.Timestamp] = None,
+    corr_window: int = CORR_WINDOW,
+    coint_window: int = 252,
+    w_coint: float = 0.5,
+    min_corr_prefilter: float = 0.70,
+    k_override: Optional[int] = None,
+) -> Tuple[pd.Series, int]:
+    """Spectral clustering on blended A_ret (Method A) + A_coint affinity.
+
+    A_fused = (1 - w_coint) * A_ret  +  w_coint * A_coint
+
+    Method A correlation affinity (A_ret) captures co-movement; A_coint captures
+    cointegration strength. Blending ensures the cluster structure favors pairs
+    that BOTH co-move AND cointegrate — better raw material for discovery.
+
+    w_coint=0.5 is the default; w_coint=0 reduces to pure Method A.
+
+    Args:
+        stock_rets:  (dates × tickers) daily returns
+        close_df:    (dates × tickers) adjusted close prices (for ADF spread)
+        end_date:    formation date; defaults to last available
+        corr_window: trailing days for LW correlation + Method A embedding (126d)
+        coint_window: trailing days for ADF computation (252d; more ADF power)
+        w_coint:     weight of cointegration affinity (default 0.5)
+        min_corr_prefilter: min LW corr to run ADF test (default 0.70; ~2k-4k pairs for N=300)
+        k_override:  fix k; else derived from Marchenko-Pastur on correlation matrix
+
+    Returns:
+        labels: pd.Series (ticker → cluster_int)
+        k:      number of clusters used
+    """
+    # ── Method A path: A_ret + k from MP ──────────────────────────────────
+    w = _slice_window(stock_rets, end_date, corr_window)
+    tickers_a = w.columns.tolist()
+    R = w.values
+    T, N = R.shape
+    C = _lw_correlation(R)
+    k = k_override if k_override is not None else select_k_mp(C, T)
+    A_ret = (C + 1.0) / 2.0   # shift from [-1,1] to [0,1]
+
+    if w_coint <= 0.0:
+        # Pure Method A (w_coint=0): skip the expensive A_coint computation
+        V = _spectral_embedding(C, k)
+        labels = _kmeans_best(V, k)
+        return pd.Series(labels, index=tickers_a, name="cluster_a_coint"), k
+
+    # ── Cointegration affinity ─────────────────────────────────────────────
+    A_coint_full, tickers_coint = build_coint_affinity(
+        close_df, end_date=end_date,
+        corr_window=corr_window, coint_window=coint_window,
+        min_corr_prefilter=min_corr_prefilter,
+    )
+
+    # ── Align tickers between the two affinity matrices ────────────────────
+    common_tickers = [t for t in tickers_a if t in tickers_coint]
+    if not common_tickers:
+        # Fallback: pure Method A if no overlap
+        V = _spectral_embedding(C, k)
+        labels = _kmeans_best(V, k)
+        return pd.Series(labels, index=tickers_a, name="cluster_a_coint"), k
+
+    a_idx = [tickers_a.index(t) for t in common_tickers]
+    c_idx = [tickers_coint.index(t) for t in common_tickers]
+
+    A_ret_s   = A_ret[np.ix_(a_idx, a_idx)]
+    A_coint_s = A_coint_full[np.ix_(c_idx, c_idx)]
+
+    # ── Blend and cluster ──────────────────────────────────────────────────
+    A_fused = (1.0 - w_coint) * A_ret_s + w_coint * A_coint_s
+
+    k_b = int(np.clip(k, max(K_MIN, int(k * 0.8)), min(K_MAX, int(k * 1.2) + 1)))
+    labels = _spectral_on_affinity(A_fused, k_b)
+
+    return pd.Series(labels, index=common_tickers, name="cluster_a_coint"), k_b
 
 
 # ── ARI stability gate ────────────────────────────────────────────────
@@ -625,17 +1005,41 @@ def rolling_cluster_labels(
     ridge_alpha: float = RIDGE_ALPHA,
     pca_betas: Optional[int] = None,
     ortho_factors: Optional[int] = None,
+    # ── a_coint method parameters ──────────────────────────────────────────
+    close_df: Optional[pd.DataFrame] = None,
+    coint_window: int = 252,
+    w_coint: float = 0.5,
+    min_corr_prefilter: float = 0.70,
+    # ── Method C (partial-correlation) parameters ──────────────────────────
+    control_rets: Optional[pd.DataFrame] = None,
+    c_algo: str = "optics",
+    c_optics_min_samples: int = 2,
+    c_optics_xi: float = 0.05,
+    c_dbscan_eps: float = 0.5,
+    c_use_ols: bool = False,
+    # ── Method b_agglo (remote exact replication) ───────────────────────────
+    b_agglo_threshold: float = 0.4,
+    b_agglo_ridge_alphas: tuple = (0.01, 0.1, 1.0, 10.0, 100.0),
 ) -> pd.DataFrame:
     """Compute cluster labels for every refit date; apply ARI freeze gate.
 
     Args:
-        method:      'a' | 'b' | 'fused'
+        method:      'a' | 'b' | 'fused' | 'a_coint' | 'c' | 'c_optics' | 'c_dbscan'
         refit_freq:  trading days between re-estimations (default 21 ≈ monthly)
+        close_df:    required when method='a_coint' (adjusted close for ADF spread)
+        control_rets: required when method starts with 'c'; residualise stock returns
+                      vs these before computing partial-correlation distance.
+                      Pass frets[['SPY']] for market-only (Rotondi-Russo paper),
+                      or full frets for multi-factor residualisation.
+        c_algo:      clustering algo for method='c' — 'spectral'|'optics'|'dbscan'
+                     (method='c_optics'/'c_dbscan' override this)
 
     Returns:
         label_df: (dates × tickers) cluster label ints; NaN before first valid window
     """
-    burn_in = max(corr_window, beta_window)
+    is_c = method in ("c", "c_optics", "c_dbscan")
+    is_b_agglo = method == "b_agglo"
+    burn_in = max(corr_window, beta_window, coint_window if method == "a_coint" else 0)
     n_dates = len(stock_rets)
     tickers = stock_rets.columns.tolist()
 
@@ -647,10 +1051,19 @@ def rolling_cluster_labels(
 
     refit_indices = range(burn_in, n_dates, refit_freq)
 
+    # Resolve algo for method C variants
+    _c_algo = {"c": c_algo, "c_optics": "optics", "c_dbscan": "dbscan"}.get(method, c_algo)
+
     for idx in refit_indices:
         end_date = stock_rets.index[idx]
         try:
-            if method == "a":
+            if is_b_agglo:
+                new_labels, k = cluster_method_b_agglo(
+                    stock_rets, factor_rets, end_date=end_date, window=beta_window,
+                    ridge_alphas=b_agglo_ridge_alphas,
+                    distance_threshold=b_agglo_threshold,
+                )
+            elif method == "a":
                 new_labels, k = cluster_method_a(stock_rets, end_date=end_date, window=corr_window)
             elif method == "b":
                 _, k = cluster_method_a(stock_rets, end_date=end_date, window=corr_window)
@@ -658,6 +1071,24 @@ def rolling_cluster_labels(
                                               window=beta_window, ridge_alpha=ridge_alpha,
                                               pca_components=pca_betas,
                                               ortho_factors=ortho_factors)
+            elif method == "a_coint":
+                if close_df is None:
+                    raise ValueError("method='a_coint' requires close_df to be passed.")
+                new_labels, k = cluster_a_coint(
+                    stock_rets, close_df, end_date=end_date,
+                    corr_window=corr_window, coint_window=coint_window,
+                    w_coint=w_coint, min_corr_prefilter=min_corr_prefilter,
+                )
+            elif is_c:
+                ctrl = control_rets if control_rets is not None else factor_rets
+                new_labels, k = cluster_method_c_partialcorr(
+                    stock_rets, ctrl, end_date=end_date, window=corr_window,
+                    algo=_c_algo,
+                    optics_min_samples=c_optics_min_samples,
+                    optics_xi=c_optics_xi,
+                    dbscan_eps=c_dbscan_eps,
+                    use_ols=c_use_ols,
+                )
             else:
                 new_labels, k = cluster_fused(
                     stock_rets, factor_rets, end_date=end_date,
